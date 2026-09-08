@@ -40,4 +40,4 @@ jobs:
         supabase_url: ${{ secrets.SUPABASE_URL }}
         supabase_key: ${{ secrets.SUPABASE_KEY }}
       run: |
-        python -m ingestion.album_push_logic
+        python -m src.ingestion.album_push_logic

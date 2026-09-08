@@ -59,4 +59,4 @@ jobs:
         SHARD_INDEX: ${{ matrix.shard }}
         SHARD_COUNT: "4"
       run: |
-        python -m ingestion.album_push_logic
+        python -m src.ingestion.album_push_logic
