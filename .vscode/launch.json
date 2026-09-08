@@ -5,7 +5,7 @@
             "name": "Run Album Pipeline",
             "type": "debugpy",
             "request": "launch",
-            "module": "ingestion.album_push_logic",
+            "module": "src.ingestion.album_push_logic",
             "cwd": "${workspaceFolder}",
             "envFile": "${workspaceFolder}/.env"
         },
@@ -13,7 +13,7 @@
             "name": "Run Recommender",
             "type": "debugpy",
             "request": "launch",
-            "module": "recommendations.recommender",
+            "module": "src.recommendations.recommender",
             "cwd": "${workspaceFolder}",
             "envFile": "${workspaceFolder}/.env"
         }
