@@ -220,9 +220,31 @@ def get_metadata(album_name, artist_name):
             return None, reason
 
         # More than one exact match is possible (e.g. the same album
-        # reissued under separate release-groups). MusicBrainz's own search
-        # ranking is already relevance-ordered, so just take its first hit
-        # among the exact matches rather than introducing a new scoring rule.
+        # reissued under separate release-groups — a clean vs. explicit
+        # edition, a regional release, a remaster, etc.). This used to just
+        # take MusicBrainz's first hit among the exact matches, trusting its
+        # relevance ranking — but that ranking is NOT guaranteed to return
+        # candidates in the same order on every call (it can shift as
+        # MusicBrainz's own index changes). Since album_push_logic.py
+        # upserts on_conflict="mbid", a different "first hit" on a later run
+        # meant the very same real album silently got inserted as a brand
+        # new row instead of updating the existing one — issue #22 found 762
+        # albums (~39% of the catalog) duplicated this way, accumulated
+        # across repeated monthly FULL_SYNC deep syncs.
+        #
+        # Break ties deterministically instead: earliest first-release-date
+        # (a reasonable "prefer the original edition" heuristic — missing
+        # dates sort last), then lowest release-group id as a final,
+        # unconditionally stable tiebreaker. The exact tiebreak rule matters
+        # less than that it's deterministic — the same title/artist must
+        # always resolve to the same release-group.
+        exact_candidates.sort(
+            key=lambda c: (
+                not c[3].get('first-release-date'),
+                c[3].get('first-release-date') or '',
+                c[3].get('id') or '',
+            )
+        )
         _, _, best_candidate_artist_str, best_rg = exact_candidates[0]
 
         rg_id = best_rg['id']

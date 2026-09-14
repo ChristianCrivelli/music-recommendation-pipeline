@@ -6,7 +6,7 @@ from supabase import create_client, Client
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ingestion.pull_albums import fetch_notion_dataframe
-from ingestion.album_finder import get_metadata
+from ingestion.album_finder import get_metadata, _artist_name_set, _normalize_artist
 from ingestion.cleaning_methods import clean_artist_list, clean_and_normalize_tags
 from ingestion.bad_eggs import record_bad_egg as _record_bad_egg, clear_bad_eggs as _clear_bad_eggs
 from ingestion.manual_overrides import get_override
@@ -84,6 +84,68 @@ def get_existing_album_ids() -> dict:
         for row in all_rows
         if row.get("title") and row.get("id")
     }
+
+
+def find_existing_album_id(title: str, artist_names) -> str | None:
+    """Look for an existing `albums` row with this exact title
+    (case/whitespace-insensitive) and at least one overlapping artist-role
+    contributor, regardless of what mbid that row currently has.
+
+    Fix for issue #22: the main enrichment path used to upsert album_data
+    purely on on_conflict="mbid", trusting that the release-group id
+    get_metadata() picked would be stable across runs. It usually is, but
+    when MusicBrainz has more than one release-group that exactly matches a
+    title+artist (see the tie-break comment in album_finder.py), a flip to
+    a different-but-still-valid mbid meant the very same real album got
+    inserted as a brand new row instead of updating the existing one — 762
+    albums (~39% of the catalog) ended up duplicated this way. Checking by
+    title+artist first — the identity a person actually means by "this
+    album" — catches that even when the mbid changes, and also guards
+    against MusicBrainz itself later merging/splitting release-groups,
+    which a deterministic tie-break alone can't prevent.
+
+    `artist_names` accepts either a comma-joined string (e.g. this script's
+    `search_artist`) or a list of names — both are normalized the same way
+    album_finder.py's exact-match logic already does, so "existing album"
+    here means the same thing get_metadata() means by "correct match".
+
+    Returns the existing album's id, or None if no title+artist match is
+    found (a genuinely new album, or an existing title that belongs to a
+    different artist — see issue #14, two different real albums can share
+    an exact title)."""
+    candidates = (
+        supabase.table("albums")
+        .select("id")
+        .ilike("title", title.strip())
+        .execute()
+        .data
+        or []
+    )
+    if not candidates:
+        return None
+
+    artist_str = ", ".join(artist_names) if not isinstance(artist_names, str) else artist_names
+    wanted_names = _artist_name_set(artist_str)
+    if not wanted_names:
+        return None
+
+    for candidate in candidates:
+        linked = (
+            supabase.table("album_contributions")
+            .select("artists(name)")
+            .eq("album_id", candidate["id"])
+            .eq("role", "artist")
+            .execute()
+        )
+        linked_names = {
+            _normalize_artist(c["artists"]["name"])
+            for c in (linked.data or [])
+            if c.get("artists") and c["artists"].get("name")
+        }
+        if linked_names & wanted_names:
+            return candidate["id"]
+
+    return None
 
 
 def _chunked(items, size):
@@ -316,22 +378,39 @@ for row in df.itertuples():
             # #14, the FULL_SYNC crash from 2026-08-21). That constraint has
             # been dropped — see config/queries/
             # title_uniqueness_migration.sql — so mbid is now the only
-            # uniqueness this upsert has to satisfy, which is what should
-            # define "one album" here in the first place.
-            album_resp = supabase.table("albums").upsert(
-                album_data,
-                on_conflict="mbid"
-            ).execute()
+            # uniqueness this upsert has to satisfy.
+            #
+            # But "one row per mbid" and "one row per real album" turned out
+            # not to be the same thing (issue #22): get_metadata() can
+            # legitimately resolve the same title+artist to a different
+            # release-group mbid on a later run (see the tie-break comment
+            # in album_finder.py), and on_conflict="mbid" alone can't catch
+            # that — it just inserts a second row for the same album. Check
+            # by title+artist FIRST, which is what "one album" actually
+            # means here; only fall through to the mbid-keyed upsert (which
+            # still correctly handles two different artists sharing a title
+            # — issue #14 — since neither of them will title+artist-match
+            # the other) when no existing row claims this title+artist.
+            existing_album_id = find_existing_album_id(row.Title, search_artist)
 
-            # Ensure we got data back before extracting the UUID
-            if not album_resp.data:
-                print(f"Warning: No data returned from Supabase for {row.Title}. Check RLS policies.")
-                reason = "Supabase returned no data"
-                failures.append({"title": row.Title, "artists": search_artist, "reason": reason})
-                record_bad_egg(title=row.Title, artists=search_artist, reason=reason)
-                continue
+            if existing_album_id:
+                supabase.table("albums").update(album_data).eq("id", existing_album_id).execute()
+                album_db_id = existing_album_id
+            else:
+                album_resp = supabase.table("albums").upsert(
+                    album_data,
+                    on_conflict="mbid"
+                ).execute()
 
-            album_db_id = album_resp.data[0]['id']
+                # Ensure we got data back before extracting the UUID
+                if not album_resp.data:
+                    print(f"Warning: No data returned from Supabase for {row.Title}. Check RLS policies.")
+                    reason = "Supabase returned no data"
+                    failures.append({"title": row.Title, "artists": search_artist, "reason": reason})
+                    record_bad_egg(title=row.Title, artists=search_artist, reason=reason)
+                    continue
+
+                album_db_id = album_resp.data[0]['id']
 
             # This title now has a real album row, so any bad-egg flags left
             # over from a previous run (e.g. an old "MusicBrainz lookup
