@@ -1,0 +1,47 @@
+name: One-off Spotify Backfill (2026-09)
+
+# Temporary runner for the #11/#12 Spotify backfill - closes the gap where
+# 1,093 MusicBrainz-matched albums and 289 failed_lookups titles never had
+# a Spotify search run against them. Manual-trigger only, no schedule.
+# Safe to delete this file once it's been run once successfully - both
+# scripts it calls are idempotent and stay in the repo as a permanent
+# record, same as the other backfill_*.py scripts.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Resolve failed_lookups backlog via Spotify (issue #11)
+        env:
+          spotify_key: ${{ secrets.SPOTIFY_KEY }}
+          spotify_id: ${{ secrets.SPOTIFY_ID }}
+          supabase_url: ${{ secrets.SUPABASE_URL }}
+          supabase_key: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python -m src.ingestion.backfill_spotify_metadata
+
+      - name: Backfill spotify_album_id for MusicBrainz-matched albums (issue #12)
+        env:
+          spotify_key: ${{ secrets.SPOTIFY_KEY }}
+          spotify_id: ${{ secrets.SPOTIFY_ID }}
+          supabase_url: ${{ secrets.SUPABASE_URL }}
+          supabase_key: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python -m src.ingestion.backfill_spotify_album_id
