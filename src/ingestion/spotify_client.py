@@ -48,6 +48,44 @@ _API_BASE = "https://api.spotify.com/v1"
 # state, so a module-level cache is safe here.
 _token_cache = {"access_token": None, "expires_at": 0.0}
 
+# Retry-with-backoff for transient Spotify API failures (issues #11/#12
+# backfill runs showed a meaningful fraction of "no match" results were
+# actually 502 Bad Gateway responses, not a real absence of a match).
+_MAX_ATTEMPTS = 3
+_RETRY_STATUS_CODES = {502, 503, 504}
+_RETRY_BACKOFF_SECONDS = (1.5, 3)  # delay before attempt 2, and before attempt 3
+
+
+def _request_with_retry(method: str, url: str, **kwargs):
+    """requests.request(), but retries on a transient failure: a 502/503/504
+    response, or a connection-level error (timeout, reset, DNS blip, etc).
+
+    Non-transient responses (200, 404, 4xx, ...) are returned immediately on
+    the first attempt, unchanged — callers keep calling resp.raise_for_status()
+    themselves exactly as before. On a connection-level error that exhausts
+    every attempt, the underlying exception is re-raised so it still lands in
+    each call site's existing `except Exception as e:` logging.
+    """
+    last_exc = None
+    resp = None
+    for attempt in range(_MAX_ATTEMPTS):
+        try:
+            resp = requests.request(method, url, **kwargs)
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            resp = None
+        else:
+            if resp.status_code not in _RETRY_STATUS_CODES:
+                return resp
+
+        if attempt < _MAX_ATTEMPTS - 1:
+            time.sleep(_RETRY_BACKOFF_SECONDS[attempt])
+            continue
+
+        if resp is not None:
+            return resp  # exhausted retries on a 502/503/504 — let raise_for_status() handle it
+        raise last_exc
+
 
 def _get_token():
     now = time.time()
@@ -85,7 +123,7 @@ def _get_avg_track_length(album_id: str, headers: dict):
     """Minutes, averaged across the album's tracks. Needs its own call —
     the /search endpoint doesn't return per-track durations."""
     try:
-        resp = requests.get(f"{_API_BASE}/albums/{album_id}", headers=headers, timeout=10)
+        resp = _request_with_retry("GET", f"{_API_BASE}/albums/{album_id}", headers=headers, timeout=10)
         resp.raise_for_status()
         tracks = resp.json().get("tracks", {}).get("items", [])
     except Exception:
@@ -117,7 +155,8 @@ def find_spotify_album(title: str, artist: str = ""):
     query = f"album:{title} artist:{artist}" if artist else f"album:{title}"
 
     try:
-        resp = requests.get(
+        resp = _request_with_retry(
+            "GET",
             f"{_API_BASE}/search",
             headers=headers,
             params={"q": query, "type": "album", "limit": 1},
@@ -193,7 +232,8 @@ def get_artist_genres(artists) -> list[str]:
     genres: list[str] = []
     for name in artists:
         try:
-            resp = requests.get(
+            resp = _request_with_retry(
+                "GET",
                 f"{_API_BASE}/search",
                 headers=headers,
                 params={"q": f"artist:{name}", "type": "artist", "limit": 1},
