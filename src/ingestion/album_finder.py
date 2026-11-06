@@ -155,6 +155,78 @@ def _title_exact_match(candidate_title, expected_title):
     return bool(a) and bool(b) and a == b
 
 
+def find_existing_album_id(supabase, title: str, artist_names) -> str | None:
+    """Look for an existing `albums` row with this exact title
+    (case/whitespace-insensitive) and at least one overlapping artist-role
+    contributor, regardless of what mbid that row currently has.
+
+    Fix for issue #22: the main enrichment path used to upsert album_data
+    purely on on_conflict="mbid", trusting that the release-group id
+    get_metadata() picked would be stable across runs. It usually is, but
+    when MusicBrainz has more than one release-group that exactly matches a
+    title+artist (see the tie-break comment above), a flip to a
+    different-but-still-valid mbid meant the very same real album got
+    inserted as a brand new row instead of updating the existing one — 762
+    albums (~39% of the catalog) ended up duplicated this way. Checking by
+    title+artist first — the identity a person actually means by "this
+    album" — catches that even when the mbid changes, and also guards
+    against MusicBrainz itself later merging/splitting release-groups,
+    which a deterministic tie-break alone can't prevent.
+
+    Originally lived in album_push_logic.py (bound to that script's module-
+    level `supabase` client); moved here and parameterized with an explicit
+    `supabase` argument — mirroring the record_bad_egg/clear_bad_eggs
+    wrapper pattern in bad_eggs.py — so spotify_client.py's Spotify-fallback
+    path can share the exact same title+artist disambiguation instead of
+    its own weaker, artist-blind title lookup (issue #24: that gap let the
+    Spotify-fallback path re-insert an album it had already resolved on a
+    prior run, since it never checked artist before deciding "does this
+    already exist").
+
+    `artist_names` accepts either a comma-joined string (e.g. this script's
+    `search_artist`) or a list of names — both are normalized the same way
+    this file's exact-match logic already does, so "existing album" here
+    means the same thing get_metadata() means by "correct match".
+
+    Returns the existing album's id, or None if no title+artist match is
+    found (a genuinely new album, or an existing title that belongs to a
+    different artist — see issue #14, two different real albums can share
+    an exact title)."""
+    candidates = (
+        supabase.table("albums")
+        .select("id")
+        .ilike("title", title.strip())
+        .execute()
+        .data
+        or []
+    )
+    if not candidates:
+        return None
+
+    artist_str = ", ".join(artist_names) if not isinstance(artist_names, str) else artist_names
+    wanted_names = _artist_name_set(artist_str)
+    if not wanted_names:
+        return None
+
+    for candidate in candidates:
+        linked = (
+            supabase.table("album_contributions")
+            .select("artists(name)")
+            .eq("album_id", candidate["id"])
+            .eq("role", "artist")
+            .execute()
+        )
+        linked_names = {
+            _normalize_artist(c["artists"]["name"])
+            for c in (linked.data or [])
+            if c.get("artists") and c["artists"].get("name")
+        }
+        if linked_names & wanted_names:
+            return candidate["id"]
+
+    return None
+
+
 def get_artist_tags(artist_mbid):
     """Fetch an artist's own MusicBrainz tag-list, sorted by community votes.
     Used as a fallback when a specific release-group has few/no tags of its own."""
@@ -261,7 +333,35 @@ def get_metadata(album_name, artist_name):
         # --- EXTRACT HIGHER-LEVEL TAXONOMY ---
         primary_type = rg_data.get('primary-type', 'Unknown')
         secondary_types = rg_data.get('secondary-type-list', [])
-        
+
+        # Contributors are built from the release-GROUP's own artist-credit,
+        # not a specific release's (see the release-list block below) — this
+        # is the exact string _artist_exact_match() already validated against
+        # `artist_name` above, so whatever gets linked into album_contributions
+        # always stays consistent with what a future run's
+        # find_existing_album_id() will search for. A specific RELEASE inside
+        # this release-group can legitimately carry a *different*
+        # artist-credit than the release-group itself (e.g. "3.15.20"'s
+        # release-group is credited to "Childish Gambino" — an exact match for
+        # Notion's artist field — but a "Donald Glover Presents..." bootleg
+        # release that MusicBrainz has since folded into that same
+        # release-group is release-credited to "Donald Glover"). Preferring
+        # the release-level credit here used to silently store "Donald
+        # Glover" as this album's contributor despite matching under
+        # "Childish Gambino", so find_existing_album_id() could never match
+        # a later run's Notion-sourced "Childish Gambino" back against it —
+        # the pipeline inserted a brand new row instead of updating the
+        # existing one (issue #24), on top of MusicBrainz separately having
+        # merged that bootleg release-group into this one between runs, which
+        # also changed the release-group id ("mbid") between runs. Anchoring
+        # contributors to the validated release-group credit fixes the first
+        # half of that; the tiebreak comment above already covers the second.
+        artist_dicts = [
+            {'name': c['artist']['name'], 'mbid': c['artist']['id']}
+            for c in rg_data.get('artist-credit', [])
+            if isinstance(c, dict) and 'artist' in c
+        ]
+
         # Sort tags by community votes (count) and take the top 5
         raw_tags = rg_data.get('tag-list', [])
         sorted_tags = sorted(raw_tags, key=lambda x: int(x.get('count', 0)), reverse=True)
@@ -297,8 +397,8 @@ def get_metadata(album_name, artist_name):
         avg_track_length = None
         labels = []
         artist_mbids = []
-        artist_dicts = []  # Tip 2: initialise here so it always exists
         release_id = None  # Tip 2: initialise here so it always exists
+        release_data = None  # same reasoning — only set inside the release-list block below
         producers = []  # initialise here so it always exists, same reasoning
  
         # We need a specific release to get tracks and labels. We'll just grab the first one.
@@ -337,15 +437,6 @@ def get_metadata(album_name, artist_name):
                 avg_ms = total_ms / track_count
                 avg_track_length = round(avg_ms / 60000, 2) # Convert to minutes
 
-            # Tip 2: build artist_dicts inside the block where release_data is guaranteed to exist
-            if 'artist-credit' in release_data:
-                for c in release_data['artist-credit']:
-                    if isinstance(c, dict) and 'artist' in c:
-                        artist_dicts.append({
-                            'name': c['artist']['name'],
-                            'mbid': c['artist']['id']
-                        })
-
             # Extract producer credits from the same release_data fetched
             # above (now includes "artist-rels") instead of a second
             # get_release_by_id call — see the comment on that fetch.
@@ -358,24 +449,18 @@ def get_metadata(album_name, artist_name):
                             'mbid': artist_info['id']
                         })
 
-        # Fallback: the specific release sometimes has no artist-credit data
-        # at all (not just a missing mbid — the whole block absent), which
-        # is a separate cause of "Unknown artist" from the missing-mbid case
-        # handled downstream in album_push_logic.py. The release-group level
-        # almost always has artist-credit, and we already fetch it above
-        # (via includes=["artist-credits"]) for the tag fallback, so this
-        # costs no extra request.
-        if not artist_dicts:
-            rg_artist_dicts = [
+        # Edge case: the release-group itself has no artist-credit at all
+        # (vanishingly rare — every release-group matched above just passed
+        # an exact artist-credit check against it) but the specific release
+        # does. Fall back to the release's artist-credit only here, as a
+        # last resort, rather than leaving this album with no contributors.
+        if not artist_dicts and release_data:
+            artist_dicts = [
                 {'name': c['artist']['name'], 'mbid': c['artist']['id']}
-                for c in rg_data.get('artist-credit', [])
+                for c in release_data.get('artist-credit', [])
                 if isinstance(c, dict) and 'artist' in c
             ]
-            if rg_artist_dicts:
-                artist_dicts = rg_artist_dicts
-                if not artist_mbids:
-                    artist_mbids = [a['mbid'] for a in rg_artist_dicts if a.get('mbid')]
-                
+
         # 3. Return the compiled feature vector
         print(f"Found data for {album_name} by {artist_name}")
  

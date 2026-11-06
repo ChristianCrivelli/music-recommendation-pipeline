@@ -38,6 +38,7 @@ import time
 import requests
 
 from ingestion.cleaning_methods import clean_and_normalize_tags
+from ingestion.album_finder import find_existing_album_id
 
 _TOKEN_URL = "https://accounts.spotify.com/api/token"
 _API_BASE = "https://api.spotify.com/v1"
@@ -316,11 +317,21 @@ def apply_spotify_fallback(supabase, title: str, artists, extra_fields: dict | N
     # mbid is NULL here (Spotify has no MusicBrainz id), same as the
     # manual-override path in album_push_logic.py, so on_conflict="mbid"
     # can't be used — find-or-update by title instead.
-    existing_rows = (
-        supabase.table("albums").select("id").eq("title", title).execute().data or []
-    )
-    if existing_rows:
-        album_db_id = existing_rows[0]["id"]
+    #
+    # issue #24: this used to be a plain .eq("title", title) lookup taking
+    # existing_rows[0] with no artist check at all — fine as long as a
+    # title only ever belonged to one artist, but issue #14 established
+    # that's not guaranteed (two different real albums can share an exact
+    # title), and more importantly, an exact-title match here says nothing
+    # about whether it's actually a case-sensitive byte-for-byte match
+    # either. find_existing_album_id() already does the right thing for
+    # the MusicBrainz-success path (issue #22) — case/whitespace-
+    # insensitive title match, disambiguated by artist-role overlap in
+    # album_contributions — so reuse it here instead of a second, weaker
+    # existence check that can't tell "this exact album, resolved again"
+    # apart from "a different album that happens to share this title".
+    album_db_id = find_existing_album_id(supabase, title, artist_list)
+    if album_db_id:
         supabase.table("albums").update(album_data).eq("id", album_db_id).execute()
     else:
         created = supabase.table("albums").insert(album_data).execute()
