@@ -39,6 +39,7 @@ import requests
 
 from ingestion.cleaning_methods import clean_and_normalize_tags
 from ingestion.album_finder import find_existing_album_id
+from ingestion.lastfm_client import get_artist_tags as get_lastfm_tags
 
 _TOKEN_URL = "https://accounts.spotify.com/api/token"
 _API_BASE = "https://api.spotify.com/v1"
@@ -358,9 +359,12 @@ def apply_spotify_fallback(supabase, title: str, artists, extra_fields: dict | N
             ).execute()
 
     # Issue #14's tag-guarantee prerequisite: a Spotify-fallback album has
-    # no MusicBrainz tags by definition, so try Spotify's artist genres
-    # before leaving it tagless.
-    genres = clean_and_normalize_tags(get_artist_genres(artist_list))
+    # no MusicBrainz tags by definition, so try a tag fallback before
+    # leaving it tagless. Last.fm artist tags first (2026-11-10: added
+    # alongside Spotify's own artist genres, since that field has become
+    # widely unreliable industry-wide — see lastfm_client.py), then
+    # Spotify genres if Last.fm also has nothing.
+    genres = clean_and_normalize_tags(get_lastfm_tags(artist_list) or get_artist_genres(artist_list))
     tagged = apply_genre_tags(supabase, album_db_id, genres)
 
     return {"resolved": True, "tagged": tagged}

@@ -11,6 +11,7 @@ from ingestion.cleaning_methods import clean_artist_list, clean_and_normalize_ta
 from ingestion.bad_eggs import record_bad_egg as _record_bad_egg, clear_bad_eggs as _clear_bad_eggs
 from ingestion.manual_overrides import get_override
 from ingestion.spotify_client import apply_spotify_fallback, get_cover_art_fallback, get_artist_genres
+from ingestion.lastfm_client import get_artist_tags as get_lastfm_tags
 
 
 load_dotenv()
@@ -427,9 +428,13 @@ for row in df.itertuples():
             # has a release-group match but no tags on it at all. Before
             # falling back to a bad egg, try Spotify's artist genres —
             # cheap (one extra call only when MusicBrainz came up empty)
-            # and closes most of what used to be a permanent gap.
+            # and closes most of what used to be a permanent gap. Last.fm
+            # first (2026-11-10: added alongside Spotify's own artist
+            # genres, since that field has become widely unreliable
+            # industry-wide — see lastfm_client.py), then Spotify genres
+            # if Last.fm also has nothing.
             if not top_tags:
-                top_tags = clean_and_normalize_tags(get_artist_genres(row.Artists))
+                top_tags = clean_and_normalize_tags(get_lastfm_tags(row.Artists) or get_artist_genres(row.Artists))
 
             if top_tags:
                 # Substitute, don't just accumulate: if this album already has
@@ -471,7 +476,7 @@ for row in df.itertuples():
                 record_bad_egg(
                     title=row.Title,
                     artists=search_artist,
-                    reason="No tags found from MusicBrainz release-group/artist, or Spotify artist genres — needs a manual tag override.",
+                    reason="No tags found from MusicBrainz release-group/artist, Last.fm artist tags, or Spotify artist genres — needs a manual tag override.",
                 )
 
             print(f"Success! Added {len(contributors)} contributors and {len(top_tags)} tags.")
@@ -574,18 +579,18 @@ for row in df.itertuples():
             # Tags: prefer whatever Chris entered in manual_tags — he knows
             # this album better than an API would, by definition, which is
             # why it needed a manual override in the first place. Only when
-            # manual_tags is empty does this fall back to Spotify artist
-            # genres (get_artist_genres + clean_and_normalize_tags), the
-            # exact same fallback the MusicBrainz-failure branch above
-            # already uses. Before this, the full-manual path never tried
-            # any fallback at all once skip_musicbrainz was set — every one
-            # of these albums stayed tagless forever unless manual_tags was
+            # manual_tags is empty does this fall back to Last.fm artist
+            # tags, then Spotify artist genres, the same two-source
+            # fallback chain the MusicBrainz-failure branches above use.
+            # Before 2026-11-10, the full-manual path never tried any
+            # fallback at all once skip_musicbrainz was set — every one of
+            # these albums stayed tagless forever unless manual_tags was
             # filled in by hand, which is how 97 of the library's 156
             # untagged albums (as of 2026-11-10) turned out to be manual
-            # overrides nobody had gotten around to tagging, not a MusicBrainz
-            # or Spotify gap at all.
+            # overrides nobody had gotten around to tagging, not a
+            # MusicBrainz or Spotify gap at all.
             manual_tags = override.get("manual_tags")
-            top_tags = clean_and_normalize_tags(manual_tags) if manual_tags else clean_and_normalize_tags(get_artist_genres(manual_artist_names))
+            top_tags = clean_and_normalize_tags(manual_tags) if manual_tags else clean_and_normalize_tags(get_lastfm_tags(manual_artist_names) or get_artist_genres(manual_artist_names))
 
             supabase.table("album_tags").delete().eq("album_id", album_db_id).execute()
             for tag_name in top_tags:
@@ -598,17 +603,14 @@ for row in df.itertuples():
                     ).execute()
 
             if not manual_tags and not top_tags:
-                # Spotify's artist-genres field has gotten increasingly
-                # unreliable industry-wide (it now frequently comes back
-                # empty even for major, well-known artists — a widely
-                # reported Spotify API issue, not something this pipeline
-                # can fix) — flag it the same way the MusicBrainz-failure
-                # branch flags its own tag misses, so it surfaces in
-                # failed_lookups instead of silently staying blank.
+                # Both fallbacks came up empty — flag it the same way the
+                # MusicBrainz-failure branch flags its own tag misses, so
+                # it surfaces in failed_lookups instead of silently
+                # staying blank.
                 record_bad_egg(
                     title=row.Title,
                     artists=search_artist,
-                    reason="Manual override has no manual_tags, and Spotify artist genres came back empty — needs a manual tag entry.",
+                    reason="Manual override has no manual_tags, and Last.fm/Spotify artist tags both came back empty — needs a manual tag entry.",
                 )
 
             print(f"Success (manual)! Added {len(manual_artist_names)} contributor(s) and {len(top_tags)} tag(s).")

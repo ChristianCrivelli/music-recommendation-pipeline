@@ -1,18 +1,25 @@
 """
-One-off backfill (issue #14's tag-guarantee prerequisite): try Spotify
-artist genres for every album that currently has zero tags. As of
-2026-08-29 that's 195 albums — a mix of MusicBrainz successes that came
-back with no tags, and older rows from before this pipeline tried as hard
-as it does now. The ongoing pipeline (album_push_logic.py /
-spotify_client.apply_spotify_fallback) now tries this automatically for
-new albums going forward; this script is just to clear the existing gap
-in one pass, which is what #14's "every card shows 1-3 tags" needs before
-it can ship without surfacing a wall of blank tag rows.
+One-off backfill (issue #14's tag-guarantee prerequisite): try Last.fm
+artist tags, then Spotify artist genres, for every album that currently
+has zero tags. As of 2026-08-29 that was 195 albums; as of 2026-11-10,
+156 — a mix of MusicBrainz successes that came back with no tags, manual
+overrides that never had a tag fallback attempted at all (fixed
+2026-11-10 — see album_push_logic.py), and Spotify-fallback albums whose
+artist genres came back empty, which turns out to be a widely-reported
+Spotify API reliability issue, not something unique to this library (see
+lastfm_client.py and the 2026-11-10 note in the book-research-proposal
+project doc). The ongoing pipeline (album_push_logic.py /
+spotify_client.apply_spotify_fallback) now tries both fallbacks
+automatically for new albums going forward; this script is just to clear
+the existing gap in one pass, which is what #14's "every card shows 1-3
+tags" needs before it can ship without surfacing a wall of blank tag rows.
 
-Run locally once, after adding real spotify_id/spotify_key to your .env:
+Run locally once, after adding real spotify_id/spotify_key (and, for the
+Last.fm fallback, lastfm_key — https://www.last.fm/api/account/create)
+to your .env:
     python -m src.ingestion.backfill_tags
 
-Safe to re-run — anything Spotify still has no genres for is left
+Safe to re-run — anything both sources still have no tags for is left
 untagged, unchanged, for a manual tag pass later.
 """
 
@@ -24,6 +31,7 @@ from supabase import create_client, Client
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ingestion.spotify_client import get_artist_genres, apply_genre_tags
+from ingestion.lastfm_client import get_artist_tags as get_lastfm_tags
 from ingestion.cleaning_methods import clean_and_normalize_tags
 from ingestion.bad_eggs import record_bad_egg as _record_bad_egg, clear_bad_eggs as _clear_bad_eggs
 
@@ -75,7 +83,7 @@ def _artist_names(album_id: str) -> list[str]:
 
 def main():
     untagged = _untagged_albums()
-    print(f"{len(untagged)} album(s) with zero tags — trying Spotify artist genres for each.")
+    print(f"{len(untagged)} album(s) with zero tags — trying Last.fm, then Spotify artist genres, for each.")
 
     tagged, still_untagged = 0, 0
     for album in untagged:
@@ -86,7 +94,7 @@ def main():
             continue
 
         try:
-            genres = clean_and_normalize_tags(get_artist_genres(artists))
+            genres = clean_and_normalize_tags(get_lastfm_tags(artists) or get_artist_genres(artists))
         except Exception as e:
             print(f"  error on {album['title']}: {e}")
             genres = []
@@ -100,12 +108,12 @@ def main():
                 supabase,
                 album["title"],
                 ", ".join(artists),
-                "No tags found from MusicBrainz or Spotify artist genres — needs a manual tag override.",
+                "No tags found from MusicBrainz, Last.fm artist tags, or Spotify artist genres — needs a manual tag override.",
             )
             print(f"  still untagged: {album['title']}")
             still_untagged += 1
 
-    print(f"\nDone. {tagged} album(s) tagged via Spotify, {still_untagged} still need a manual look.")
+    print(f"\nDone. {tagged} album(s) tagged via Last.fm/Spotify, {still_untagged} still need a manual look.")
 
 
 if __name__ == "__main__":
